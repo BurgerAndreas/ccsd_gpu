@@ -352,7 +352,6 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=F
     l2new -= cupy.einsum("jbki,ka->jiba", eris_ovoo, l1)
 
     tau = _make_tau_gpu(t2, t1, t1)
-    l2tau = cupy.einsum("ijcd,klcd->ijkl", l2, tau)
     l2_perm = l2.transpose(0, 2, 1, 3) - l2.transpose(0, 3, 1, 2) * 0.5
 
     blksize = _gpu_block_size(mycc, nocc, nvir, tensor_factor=10 * max(1, nocc))
@@ -388,7 +387,9 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=F
         l2new[:, :, p0:p1] -= cupy.einsum("bjka,ik->jiba", eris_voov, mij1)
         l1new[:, p0:p1] += cupy.einsum("aijb,jb->ia", eris_voov, mia1) * 2
         l1new -= cupy.einsum("bija,jb->ia", eris_voov, mia1[:, p0:p1])
-        m4 = cupy.einsum("ijkl,aklb->ijab", l2tau, eris_voov)
+        # Fuse the l2-tau contraction into the voov block contraction to avoid
+        # materializing the full nocc^4 l2tau tensor.
+        m4 = cupy.einsum("ijcd,klcd,aklb->ijab", l2, tau, eris_voov)
         l2new[:, :, p0:p1] += m4 * 0.5
         l1new[:, p0:p1] += cupy.einsum("ijab,jb->ia", m4, t1) * 2
         l1new -= cupy.einsum("ijba,jb->ia", m4, t1[:, p0:p1])

@@ -33,3 +33,14 @@ Currently:
 4. Response equations in the gradient path: partially GPU-accelerated in your custom `gpu_ccsd_grad` code.
 
 `lambda` is usually the same scaling and about as much work as the CCSD amplitude solve, since it requires another iterative tensor-equation solve with expensive contractions.
+
+## Timings
+
+Interactive GPU timings measured on March 25, 2026 on an NVIDIA A100-SXM4-80GB.
+
+| Molecule | Basis | RHF (s) | CCSD (s) | Lambda (s) | Gradient (s) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| H2O | cc-pVDZ | 2.28 | 5.43 | 3.03 | 1.13 |
+| H2O | cc-pVTZ | 1.86 | 10.38 | 7.41 | 1.82 |
+| Aniline | def2-SVP | 13.85 | 46.17 | 20.22 | 5.02 |
+| Aniline | cc-pVTZ | running | running | running | running |
