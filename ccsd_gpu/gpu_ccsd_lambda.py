@@ -4,7 +4,8 @@ Ports the dominant-cost parts of ``pyscf.cc.ccsd_lambda`` to CuPy while
 keeping a small CPU fallback surface for pieces that are still missing from
 ``gpu4pyscf``:
 
-- The ``vvvv`` contribution uses the CPU ``_add_vvvv`` helper.
+- The ``vvvv`` contribution prefers the GPU4PySCF direct AO path and falls
+  back to the CPU ``_add_vvvv`` helper only when needed.
 - DIIS packs amplitudes on CPU once per outer iteration.
 
 This keeps the expensive intermediate builds and blocked lambda contractions
@@ -16,13 +17,16 @@ from functools import reduce
 import numpy
 
 from pyscf import lib
-from pyscf.cc import _ccsd, ccsd
+from pyscf.cc import ccsd
 from pyscf.lib import logger
 
 try:
     import cupy
 except Exception:  # pragma: no cover - exercised through CPU fallback
     cupy = None
+
+
+_GPU_DIRECT_VVVV = None
 
 
 def _has_usable_gpu():
@@ -51,6 +55,19 @@ def _as_cupy_c_order(a):
     return cupy.asarray(numpy.asarray(a, order="C"))
 
 
+def _get_gpu_direct_vvvv():
+    global _GPU_DIRECT_VVVV
+    if _GPU_DIRECT_VVVV is not None:
+        return _GPU_DIRECT_VVVV
+    try:
+        from gpu4pyscf.cc import ccsd_incore as gpu_ccsd_incore
+
+        _GPU_DIRECT_VVVV = gpu_ccsd_incore._direct_ovvv_vvvv
+    except Exception:
+        _GPU_DIRECT_VVVV = False
+    return _GPU_DIRECT_VVVV
+
+
 def _gpu_block_size(mycc, nocc, nvir, tensor_factor):
     """Conservative virtual/orbital block size for GPU temporary tensors."""
     free_gpu_bytes = int(cupy.cuda.runtime.memGetInfo()[0] * 0.45)
@@ -63,6 +80,71 @@ def _gpu_block_size(mycc, nocc, nvir, tensor_factor):
 
 class _IMDS:
     pass
+
+
+def _add_vvvv_gpu(mycc, l2, log):
+    """Return the lambda ``vvvv`` contraction on GPU.
+
+    This reuses the GPU4PySCF direct AO ``vvvv`` path. Setting ``t1 = 0``
+    removes the extra ``ovvv`` correction terms, leaving exactly the
+    ``Ht2 = einsum('ijcd,acdb->ijab', l2, vvvv)`` piece required by the
+    lambda equations.
+    """
+    direct_vvvv = _get_gpu_direct_vvvv()
+    if direct_vvvv is False:
+        raise RuntimeError("gpu4pyscf direct vvvv helper is unavailable")
+
+    nocc, nvir = l2.shape[0], l2.shape[2]
+    zero_t1 = cupy.zeros((nocc, nvir), dtype=l2.dtype)
+    try:
+        _, _, l2new, _, _ = direct_vvvv(mycc, zero_t1, l2)
+    except Exception as exc:
+        log.debug1("gpu direct vvvv failed; falling back to CPU helper: %s", exc)
+        raise
+    return cupy.asarray(l2new)
+
+
+def _build_vvov_slice(ovvv_blocks_cpu, p0, p1, nvir, nocc, dtype):
+    """Assemble one ``vvov`` slice on GPU without storing all blocks on device."""
+    eris_vvov = cupy.empty((p1 - p0, nvir, nocc, nvir), dtype=dtype)
+    q0 = 0
+    for block in ovvv_blocks_cpu:
+        q1 = q0 + block.shape[3]
+        eris_vvov[:, :, :, q0:q1] = cupy.asarray(block[p0:p1], dtype=dtype)
+        q0 = q1
+    return eris_vvov
+
+
+def _make_tau_gpu(t2, t1a, t1b, fac=1.0):
+    tau = cupy.einsum("ia,jb->ijab", t1a * fac, t1b)
+    tau += t2
+    return tau
+
+
+def _prepare_virtual_block_cache(eris, nvir, blksize):
+    """Cache one CPU C-order copy per virtual block/layout.
+
+    This avoids repeated host-side slicing/transposition of the same ERI blocks
+    across both ``make_intermediates_gpu`` and ``update_lambda_gpu``.
+    """
+    cache = []
+    for p0, p1 in lib.prange(0, nvir, blksize):
+        ovvv = numpy.asarray(eris.get_ovvv(slice(None), slice(p0, p1)), order="C")
+        ovoo = numpy.asarray(eris.ovoo[:, p0:p1], order="C")
+        ovvo = numpy.asarray(eris.ovvo[:, p0:p1], order="C")
+        oovv = numpy.asarray(eris.oovv[:, :, p0:p1], order="C")
+        cache.append(
+            {
+                "p0": p0,
+                "p1": p1,
+                "ovvv": ovvv,
+                "vvov": ovvv.transpose(2, 3, 0, 1).copy(),
+                "ovoo": ovoo,
+                "ovvo_t": ovvo.transpose(1, 0, 3, 2).copy(),
+                "oovv_t": oovv.transpose(2, 1, 0, 3).copy(),
+            }
+        )
+    return cache
 
 
 def make_intermediates_gpu(mycc, t1, t2, eris):
@@ -97,24 +179,25 @@ def make_intermediates_gpu(mycc, t1, t2, eris):
         int((nvir + blksize - 1) // blksize),
     )
 
-    vvov_blocks = []
-    for p0, p1 in lib.prange(0, nvir, blksize):
-        eris_ovvv = _as_cupy_c_order(eris.get_ovvv(slice(None), slice(p0, p1)))
-        vvov_blocks.append(eris_ovvv.transpose(2, 3, 0, 1).copy())
+    block_cache = _prepare_virtual_block_cache(eris, nvir, blksize)
+    imds.block_cache = block_cache
 
     woooo = cupy.zeros((nocc, nocc, nocc, nocc), dtype=t1.dtype)
     wvooo = cupy.zeros((nvir, nocc, nocc, nocc), dtype=t1.dtype)
     tau_full = t2 + cupy.einsum("ia,jb->ijab", t1, t1)
-    theta_full = t2 * 2 - t2.transpose(1, 0, 2, 3)
 
-    for istep, (p0, p1) in enumerate(lib.prange(0, nvir, blksize)):
-        eris_ovvv = _as_cupy_c_order(eris.get_ovvv(slice(None), slice(p0, p1)))
-        eris_vvov = cupy.concatenate([blk[p0:p1] for blk in vvov_blocks], axis=3)
+    for block in block_cache:
+        p0 = block["p0"]
+        p1 = block["p1"]
+        eris_ovvv = cupy.asarray(block["ovvv"])
+        eris_vvov = _build_vvov_slice(
+            [entry["vvov"] for entry in block_cache], p0, p1, nvir, nocc, t1.dtype
+        )
 
         w1 += cupy.einsum("jcba,jc->ba", eris_ovvv, t1[:, p0:p1] * 2)
         w1[:, p0:p1] -= cupy.einsum("jabc,jc->ba", eris_ovvv, t1)
-        theta = t2[:, :, :, p0:p1] * 2 - t2[:, :, :, p0:p1].transpose(1, 0, 2, 3)
-        w3 += cupy.einsum("jkcd,kdcb->bj", theta, eris_ovvv)
+        theta_p = t2[:, :, :, p0:p1] * 2 - t2[:, :, :, p0:p1].transpose(1, 0, 2, 3)
+        w3 += cupy.einsum("jkcd,kdcb->bj", theta_p, eris_ovvv)
         wVOov = cupy.einsum("jbcd,kd->bjkc", eris_ovvv, t1)
         wvOOv = cupy.einsum("cbjd,kd->cjkb", eris_vvov, -t1)
         g2vovv = eris_vvov.transpose(0, 2, 1, 3) * 2 - eris_vvov.transpose(0, 2, 3, 1)
@@ -133,11 +216,11 @@ def make_intermediates_gpu(mycc, t1, t2, eris):
             wvvov[:, :, i0:i1] += vackb.transpose(0, 3, 2, 1)
             wvvov[:, :, i0:i1] -= vackb * 0.5
 
-        eris_ovoo = _as_cupy_c_order(eris.ovoo[:, p0:p1])
+        eris_ovoo = cupy.asarray(block["ovoo"])
         w2 += cupy.einsum("kbij,kb->ij", eris_ovoo, t1[:, p0:p1]) * 2
         w2 -= cupy.einsum("ibkj,kb->ij", eris_ovoo, t1[:, p0:p1])
-        theta = t2[:, :, p0:p1].transpose(1, 0, 2, 3) * 2 - t2[:, :, p0:p1]
-        w3 -= cupy.einsum("lckj,klcb->bj", eris_ovoo, theta)
+        theta_o = t2[:, :, p0:p1].transpose(1, 0, 2, 3) * 2 - t2[:, :, p0:p1]
+        w3 -= cupy.einsum("lckj,klcb->bj", eris_ovoo, theta_o)
 
         tmp = cupy.einsum("lc,jcik->ijkl", t1[:, p0:p1], eris_ovoo)
         woooo += tmp
@@ -150,12 +233,11 @@ def make_intermediates_gpu(mycc, t1, t2, eris):
         wvooo -= cupy.einsum("klbc,iblj->ckij", t2[:, :, p0:p1], eris_ovoo * 1.5)
 
         g2ovoo = eris_ovoo * 2 - eris_ovoo.transpose(2, 1, 0, 3)
-        theta = t2[:, :, :, p0:p1] * 2 - t2[:, :, :, p0:p1].transpose(1, 0, 2, 3)
-        vcjik = cupy.einsum("jlcb,lbki->cjki", theta, g2ovoo)
+        vcjik = cupy.einsum("jlcb,lbki->cjki", theta_p, g2ovoo)
         wvooo += vcjik.transpose(0, 3, 2, 1)
         wvooo -= vcjik * 0.5
 
-        eris_voov = _as_cupy_c_order(eris.ovvo[:, p0:p1]).transpose(1, 0, 3, 2)
+        eris_voov = cupy.asarray(block["ovvo_t"])
         tau = t2[:, :, p0:p1] + cupy.einsum("ia,jb->ijab", t1[:, p0:p1], t1)
         woooo += cupy.einsum("cijd,klcd->ijkl", eris_voov, tau)
 
@@ -175,7 +257,7 @@ def make_intermediates_gpu(mycc, t1, t2, eris):
         VOov -= cupy.einsum("bjld,kldc->bjkc", eris_voov, t2)
         VOov += eris_voov
         vOOv = cupy.einsum("bljd,kldc->bjkc", eris_voov, t2)
-        vOOv -= _as_cupy_c_order(eris.oovv[:, :, p0:p1]).transpose(2, 1, 0, 3)
+        vOOv -= cupy.asarray(block["oovv_t"])
         wVOov += VOov
         wvOOv += vOOv
         imds.wVOov[p0:p1] = wVOov
@@ -190,7 +272,6 @@ def make_intermediates_gpu(mycc, t1, t2, eris):
         wvvov += cupy.einsum("ajkc,jb->abkc", ov1, t1)
         wvvov -= cupy.einsum("ajkb,jc->abkc", ov2, t1)
 
-        eris_ovoo = _as_cupy_c_order(eris.ovoo[:, p0:p1])
         g2ovoo = eris_ovoo * 2 - eris_ovoo.transpose(2, 1, 0, 3)
         wvvov += cupy.einsum("laki,klbc->abic", g2ovoo, tau_full)
         imds.wvvov[p0:p1] = wvvov
@@ -209,7 +290,7 @@ def make_intermediates_gpu(mycc, t1, t2, eris):
     return imds
 
 
-def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=True):
+def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=False):
     if imds is None:
         imds = make_intermediates_gpu(mycc, t1, t2, eris)
     time0 = logger.process_clock(), logger.perf_counter()
@@ -240,7 +321,12 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=T
             mycc._add_vvvv(None, _to_cpu(l2), eris, with_ovvv=False, t2sym="jiba")
         )
     else:
-        l2new = cupy.zeros_like(l2)
+        try:
+            l2new = _add_vvvv_gpu(mycc, l2, log)
+        except Exception:
+            l2new = cupy.asarray(
+                mycc._add_vvvv(None, _to_cpu(l2), eris, with_ovvv=False, t2sym="jiba")
+            )
     l1new = cupy.einsum("ijab,jb->ia", l2new, t1) * 2
     l1new -= cupy.einsum("jiab,jb->ia", l2new, t1)
     l2new *= 0.5
@@ -265,9 +351,9 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=T
     l1new += cupy.einsum("jaik,kj->ia", eris_ovoo, mij1)
     l2new -= cupy.einsum("jbki,ka->jiba", eris_ovoo, l1)
 
-    tau = _to_gpu(_ccsd.make_tau(_to_cpu(t2), _to_cpu(t1), _to_cpu(t1)))
+    tau = _make_tau_gpu(t2, t1, t1)
     l2tau = cupy.einsum("ijcd,klcd->ijkl", l2, tau)
-    l2t1 = cupy.einsum("jidc,kc->ijkd", l2, t1)
+    l2_perm = l2.transpose(0, 2, 1, 3) - l2.transpose(0, 3, 1, 2) * 0.5
 
     blksize = _gpu_block_size(mycc, nocc, nvir, tensor_factor=10 * max(1, nocc))
     log.debug1(
@@ -277,20 +363,25 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=T
         int((nvir + blksize - 1) // blksize),
     )
 
-    l1new -= cupy.einsum("jb,jiab->ia", l1, _as_cupy_c_order(eris.oovv))
-    for p0, p1 in lib.prange(0, nvir, blksize):
-        eris_ovvv = _as_cupy_c_order(eris.get_ovvv(slice(None), slice(p0, p1)))
+    oovv_full = _as_cupy_c_order(eris.oovv)
+    l1new -= cupy.einsum("jb,jiab->ia", l1, oovv_full)
+    for block in imds.block_cache:
+        p0 = block["p0"]
+        p1 = block["p1"]
+        eris_ovvv = cupy.asarray(block["ovvv"])
         l1new[:, p0:p1] += cupy.einsum("iabc,bc->ia", eris_ovvv, mba1) * 2
         l1new -= cupy.einsum("ibca,bc->ia", eris_ovvv, mba1[p0:p1])
         l2new[:, :, p0:p1] += cupy.einsum("jbac,ic->jiba", eris_ovvv, l1)
-        m4 = cupy.einsum("ijkd,kadb->ijab", l2t1, eris_ovvv)
+        # Fuse the l2-t1 contraction into the ovvv contraction to avoid
+        # materializing the full nocc^3*nvir l2t1 tensor.
+        m4 = cupy.einsum("jidc,kc,kadb->ijab", l2, t1, eris_ovvv)
         l2new[:, :, p0:p1] -= m4
         l1new[:, p0:p1] -= cupy.einsum("ijab,jb->ia", m4, t1) * 2
         l1new -= cupy.einsum("ijab,ia->jb", m4, t1[:, p0:p1]) * 2
         l1new[:, p0:p1] += cupy.einsum("jiab,jb->ia", m4, t1)
         l1new += cupy.einsum("jiab,ia->jb", m4, t1[:, p0:p1])
 
-        eris_voov = _as_cupy_c_order(eris.ovvo[:, p0:p1]).transpose(1, 0, 3, 2)
+        eris_voov = cupy.asarray(block["ovvo_t"])
         l1new[:, p0:p1] += cupy.einsum("jb,aijb->ia", l1, eris_voov) * 2
         l2new[:, :, p0:p1] += eris_voov.transpose(1, 2, 0, 3) * 0.5
         l2new[:, :, p0:p1] -= cupy.einsum("bjic,ca->jiba", eris_voov, mba1)
@@ -309,8 +400,7 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=T
 
         saved_wvOOv = imds.wvOOv[p0:p1]
         tmp_voov = imds.wVOov[p0:p1] * 2 + saved_wvOOv
-        tmp = l2.transpose(0, 2, 1, 3) - l2.transpose(0, 3, 1, 2) * 0.5
-        l2new[:, :, p0:p1] += cupy.einsum("iakc,bjkc->jiba", tmp, tmp_voov)
+        l2new[:, :, p0:p1] += cupy.einsum("iakc,bjkc->jiba", l2_perm, tmp_voov)
 
         tmp = cupy.einsum("jkca,bikc->jiba", l2, saved_wvOOv)
         l2new[:, :, p0:p1] += tmp
@@ -347,7 +437,7 @@ def kernel_gpu(
     max_cycle=None,
     tol=None,
     verbose=logger.INFO,
-    use_cpu_vvvv=True,
+    use_cpu_vvvv=False,
 ):
     if eris is None:
         eris = mycc.ao2mo()
@@ -415,7 +505,7 @@ def solve_lambda_gpu(
     l1=None,
     l2=None,
     eris=None,
-    use_cpu_vvvv=True,
+    use_cpu_vvvv=False,
     fallback_to_cpu=True,
 ):
     """Solve CCSD lambda with GPU-ported dominant contractions.
@@ -423,27 +513,31 @@ def solve_lambda_gpu(
     The solver updates ``mycc.converged_lambda``, ``mycc.l1`` and ``mycc.l2``
     to match the standard PySCF ``solve_lambda`` side effects.
     """
-    if not _has_usable_gpu():
-        if not fallback_to_cpu:
-            raise RuntimeError("No usable CuPy GPU runtime found for lambda solve.")
-        mycc._lambda_solver_mode = "cpu-fallback"
-        mycc.l1, mycc.l2 = mycc.solve_lambda(t1=t1, t2=t2, l1=l1, l2=l2, eris=eris)
-        return mycc.l1, mycc.l2
+    if _has_usable_gpu():
+        try:
+            conv, l1_out, l2_out = kernel_gpu(
+                mycc,
+                eris=eris,
+                t1=t1,
+                t2=t2,
+                l1=l1,
+                l2=l2,
+                max_cycle=mycc.max_cycle,
+                tol=mycc.conv_tol_normt,
+                verbose=mycc.verbose,
+                use_cpu_vvvv=use_cpu_vvvv,
+            )
+            mycc.converged_lambda = conv
+            mycc.l1 = l1_out
+            mycc.l2 = l2_out
+            mycc._lambda_solver_mode = "gpu-hybrid"
+            return mycc.l1, mycc.l2
+        except Exception:
+            if not fallback_to_cpu:
+                raise
 
-    conv, l1_out, l2_out = kernel_gpu(
-        mycc,
-        eris=eris,
-        t1=t1,
-        t2=t2,
-        l1=l1,
-        l2=l2,
-        max_cycle=mycc.max_cycle,
-        tol=mycc.conv_tol_normt,
-        verbose=mycc.verbose,
-        use_cpu_vvvv=use_cpu_vvvv,
-    )
-    mycc.converged_lambda = conv
-    mycc.l1 = l1_out
-    mycc.l2 = l2_out
-    mycc._lambda_solver_mode = "gpu-hybrid"
+    if not fallback_to_cpu:
+        raise RuntimeError("No usable CuPy GPU runtime found for lambda solve.")
+    mycc._lambda_solver_mode = "cpu-fallback"
+    mycc.l1, mycc.l2 = mycc.solve_lambda(t1=t1, t2=t2, l1=l1, l2=l2, eris=eris)
     return mycc.l1, mycc.l2

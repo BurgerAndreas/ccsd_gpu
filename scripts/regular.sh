@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=aniline-ccpvtz
 #SBATCH --account=nvr_qualg_lmbm
-#SBATCH --partition=batch_block1
+#SBATCH --partition=batch_singlenode
 #SBATCH --nodes=1
 #SBATCH --gpus=1
 #SBATCH --cpus-per-task=8
@@ -34,13 +34,45 @@ echo "Master Address: $MASTER_ADDR"
 echo "Master Port: $MASTER_PORT"
 echo "============================================"
 
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+ccsd_gpu_check_cuda_ready
 echo "============================================"
 
-if [ "$#" -gt 0 ]; then
-  CMD=("$@")
-else
+if [ "$#" -eq 0 ]; then
   CMD=(python examples/h2o_ccsd_grad.py --molecule aniline --basis cc-pvtz)
+else
+  case "$1" in
+    smoke)
+      shift
+      CMD=(python scripts/gpu_smoke_check.py "$@")
+      ;;
+    test-int2e)
+      shift
+      CMD=(python tests/test_int2e_gpu.py "$@")
+      ;;
+    test-int2e-ip1)
+      shift
+      CMD=(python tests/test_int2e_ip1_gpu.py "$@")
+      ;;
+    test-grad)
+      shift
+      CMD=(python tests/test_gpu_ccsd_grad.py "$@")
+      ;;
+    test-vvvv)
+      shift
+      CMD=(python tests/test_gpu_vvvv_lambda.py "$@")
+      ;;
+    benchmark-aniline)
+      shift
+      CMD=(python examples/h2o_ccsd_grad.py --molecule aniline --basis cc-pvtz "$@")
+      ;;
+    benchmark-h2o)
+      shift
+      CMD=(python examples/h2o_ccsd_grad.py --molecule h2o "$@")
+      ;;
+    *)
+      CMD=("$@")
+      ;;
+  esac
 fi
 
 echo "Running: uv run ${CMD[*]}"
