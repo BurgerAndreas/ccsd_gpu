@@ -17,7 +17,7 @@ The setup script exports `CUDA_PATH`, `CUDA_HOME`, and `LD_LIBRARY_PATH` from th
 Current execution split:
 - RHF reference: CPU PySCF in the example for robustness
 - CCSD T solve: GPU4PySCF when available, otherwise CPU PySCF
-- Lambda solve: local hybrid GPU solver for the dominant contractions, with CPU fallback for unsupported pieces
+- Lambda solve: local hybrid GPU solver for the dominant contractions; production default now uses CPU `vvvv` for large AO-direct cases and GPU for the remaining dominant contractions
 - Gradient assembly: custom GPU implementation in this package
 
 For analytic CCSD gradients, the steps are:
@@ -29,18 +29,28 @@ For analytic CCSD gradients, the steps are:
 Currently:
 1. SCF/HF: can be on GPU via `GPU4PySCF`.
 2. CCSD T solve: can be on GPU via `cc = gpu4pyscf.cc.ccsd_incore` when available.
-3. Lambda solve: dominant intermediate builds and update contractions can run on GPU via `ccsd_gpu.gpu_ccsd_lambda.solve_lambda_gpu`; the `vvvv` contribution still falls back to CPU.
+3. Lambda solve: dominant intermediate builds and update contractions can run on GPU via `ccsd_gpu.gpu_ccsd_lambda.solve_lambda_gpu`; for large AO-direct cases the production default is now the benchmark-proven hybrid mode `gpu-hybrid-cpu-vvvv`.
 4. Response equations in the gradient path: partially GPU-accelerated in your custom `gpu_ccsd_grad` code.
 
 `lambda` is usually the same scaling and about as much work as the CCSD amplitude solve, since it requires another iterative tensor-equation solve with expensive contractions.
 
 ## Timings
 
-Interactive GPU timings measured on March 25, 2026 on an NVIDIA A100-SXM4-80GB.
+Interactive GPU timings measured on March 25-26, 2026 on NVIDIA A100-SXM4-80GB nodes.
 
 | Molecule | Basis | RHF (s) | CCSD (s) | Lambda (s) | Gradient (s) |
 | --- | --- | ---: | ---: | ---: | ---: |
 | H2O | cc-pVDZ | 2.28 | 5.43 | 3.03 | 1.13 |
 | H2O | cc-pVTZ | 1.86 | 10.38 | 7.41 | 1.82 |
 | Aniline | def2-SVP | 13.85 | 46.17 | 20.22 | 5.02 |
-| Aniline | cc-pVTZ | running | running | running | running |
+| Aniline | cc-pVTZ | checkpointed | checkpointed | 567.98 | OOM in AO integral gradient |
+
+Checkpoint-driven aniline / cc-pVTZ lambda comparison from March 26, 2026:
+
+- CPU lambda: `1341.766s`
+- GPU lambda: `567.978s`
+- Lambda mode: `gpu-hybrid-cpu-vvvv`
+- Speedup vs CPU: `2.362x`
+- Error: `lambda_l1_err=2.406e-13`, `lambda_l2_err=8.616e-15`
+
+This is now the production default for large AO-direct lambda cases. `solve_lambda_gpu()` automatically selects CPU `vvvv` for large systems unless explicitly overridden.

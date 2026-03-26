@@ -1,9 +1,5 @@
-.venv/
+benchmark_data/
 __pycache__/
-*.py[cod]
-*.so
-.pytest_cache/
-
+*.pyc
 ccsd_gpu.egg-info/
-
 slurmlog.txt

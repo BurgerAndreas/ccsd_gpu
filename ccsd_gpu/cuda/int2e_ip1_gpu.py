@@ -32,6 +32,8 @@ _NCTR_OF   = 3
 _BAS_SLOTS = 8
 _PTR_COEFF = 6
 
+_DEFAULT_TARGET_FREE_FRACTION = 0.18
+
 
 def _check_mol(mol):
     """Return True iff the GPU kernel can handle this mol."""
@@ -139,6 +141,56 @@ def _get_basis_cached(mol):
               n_kl_pairs, max_l, max_prim)
     _basis_cache[key] = result
     return result
+
+
+def _estimate_peak_bytes(mol, b0, b1, comp):
+    """Conservative peak-memory estimate for one public int2e/int2e_ip1 call."""
+    if b0 >= b1:
+        return 0
+
+    mol_cart = mol if mol.cart else mol.copy()
+    if not mol.cart:
+        mol_cart.cart = True
+
+    dc_bas, dc_ao_loc, orig2dc, *_ = _get_basis_cached(mol_cart)
+    dc_b0 = orig2dc[b0][0]
+    dc_b1 = orig2dc[b1 - 1][-1] + 1
+    nf_cart = int(dc_ao_loc[dc_b1]) - int(dc_ao_loc[dc_b0])
+    nao_cart = int(dc_ao_loc[len(dc_bas)])
+    nao_pair_cart = nao_cart * (nao_cart + 1) // 2
+    itemsize = 8
+
+    cart_bytes = comp * nf_cart * nao_cart * nao_pair_cart * itemsize
+    peak_bytes = cart_bytes
+    if not mol.cart:
+        ao_loc_sph = mol.ao_loc_nr()
+        nf_sph = int(ao_loc_sph[b1]) - int(ao_loc_sph[b0])
+        nao_sph = int(ao_loc_sph[-1])
+        eri_kl_bytes = comp * nf_sph * nao_sph * nao_cart * nao_cart * itemsize
+        peak_bytes += eri_kl_bytes
+    return peak_bytes
+
+
+def _split_shell_range_for_memory(mol, b0, b1, comp):
+    if b0 >= b1:
+        return []
+    free_bytes = int(cupy.cuda.runtime.memGetInfo()[0])
+    target_bytes = max(1, int(free_bytes * _DEFAULT_TARGET_FREE_FRACTION))
+    chunks = []
+    start = b0
+    while start < b1:
+        stop = start + 1
+        best_stop = stop
+        while stop <= b1:
+            peak_bytes = _estimate_peak_bytes(mol, start, stop, comp)
+            if peak_bytes <= target_bytes or stop == start + 1:
+                best_stop = stop
+                stop += 1
+                continue
+            break
+        chunks.append((start, best_stop))
+        start = best_stop
+    return chunks
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +369,10 @@ def compute_int2e_ip1_gpu(mol, b0, b1):
           kl_packed = k_abs*(k_abs+1)//2 + l_abs  (k_abs >= l_abs)
         All AO indices are in the native basis (spherical or Cartesian).
     """
+    chunks = _split_shell_range_for_memory(mol, b0, b1, comp=3)
+    if len(chunks) > 1:
+        return cupy.concatenate([compute_int2e_ip1_gpu(mol, c0, c1) for c0, c1 in chunks], axis=1)
+
     if mol.cart:
         return _compute_cart(mol, b0, b1)
     # Spherical: run kernel on Cartesian copy, then apply c2s post-processing.

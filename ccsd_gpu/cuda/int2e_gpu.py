@@ -20,7 +20,7 @@ import cupy
 from ccsd_gpu.cuda.int2e_module import get_kernel
 # Reuse _check_mol and _get_basis_cached — they are identical for both kernels
 # since both share the same _L_MAX=4 and shell conventions.
-from ccsd_gpu.cuda.int2e_ip1_gpu import _check_mol, _get_basis_cached
+from ccsd_gpu.cuda.int2e_ip1_gpu import _check_mol, _get_basis_cached, _split_shell_range_for_memory
 
 # Rys quadrature max nroots supported by this kernel
 _NROOTS_MAX = 9
@@ -206,6 +206,10 @@ def compute_int2e_gpu(mol, b0, b1):
           kl_packed = k_abs*(k_abs+1)//2 + l_abs  (k_abs >= l_abs)
         All AO indices are in the native basis (spherical or Cartesian).
     """
+    chunks = _split_shell_range_for_memory(mol, b0, b1, comp=1)
+    if len(chunks) > 1:
+        return cupy.concatenate([compute_int2e_gpu(mol, c0, c1) for c0, c1 in chunks], axis=0)
+
     if mol.cart:
         return _compute_cart(mol, b0, b1)
     # Spherical: run kernel on Cartesian copy, then apply c2s post-processing.

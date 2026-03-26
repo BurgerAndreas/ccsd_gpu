@@ -53,7 +53,15 @@ def _to_gpu(a):
 
 
 def _as_cupy_c_order(a):
+    if cupy is not None and isinstance(a, cupy.ndarray):
+        return cupy.asarray(a, order="C")
     return cupy.asarray(numpy.asarray(a, order="C"))
+
+
+def _as_c_order_preserve_backend(a):
+    if cupy is not None and isinstance(a, cupy.ndarray):
+        return cupy.asarray(a, order="C")
+    return numpy.asarray(a, order="C")
 
 
 def _get_gpu_ccsd_incore():
@@ -84,6 +92,23 @@ def _gpu_block_size(mycc, nocc, nvir, tensor_factor):
     unit = max(1, 8 * tensor_factor * max(1, nocc) * max(1, nvir))
     blksize = max(1, budget // unit)
     return min(nvir, max(ccsd.BLKMIN, int(blksize)))
+
+
+def _should_default_cpu_vvvv(mycc, t1, eris):
+    """Choose the benchmark-proven hybrid path for large AO-direct vvvv cases."""
+    if getattr(mycc, "_force_gpu_vvvv", False):
+        return False
+    if getattr(mycc, "_force_cpu_vvvv", False):
+        return True
+    if eris is not None and getattr(eris, "vvvv", None) is not None:
+        return False
+
+    nocc, nvir = t1.shape
+    nao = mycc.mol.nao_nr()
+    # The AO-direct GPU vvvv path is currently slower than CPU on large systems
+    # like aniline/cc-pVTZ. Prefer the hybrid path by default once the problem
+    # is clearly in that regime.
+    return nvir >= 180 or nao >= 250 or (nocc * nvir) >= 4000
 
 
 class _IMDS:
@@ -149,15 +174,26 @@ def _build_lambda_vvvv_context(mycc, l2, gpu_ccsd_incore):
     vhfopt.build(group_size=blksize, diag_block_with_triu=True)
     mo = vhfopt.coeff.dot(cupy.asarray(mycc.mo_coeff))
     cp_idx, cp_jdx = numpy.tril_indices(len(vhfopt.uniq_l_ctr))
+    max_block_ao = 1
+    for ctr0, ctr1 in zip(vhfopt.l_ctr_offsets[:-1], vhfopt.l_ctr_offsets[1:]):
+        max_block_ao = max(max_block_ao, int(vhfopt.mol.ao_loc[ctr1] - vhfopt.mol.ao_loc[ctr0]))
     return {
         "nocc": nocc,
         "nvir": l2.shape[2],
+        "dtype": l2.dtype,
         "vhfopt": vhfopt,
         "mo": mo,
         "orbv": cupy.asarray(mo[:, nocc:]),
         "ao_loc": vhfopt.mol.ao_loc,
         "cp_idx": cp_idx,
         "cp_jdx": cp_jdx,
+        "nao": nao_cart,
+        "nocc2": nocc2,
+        "idx": cupy.asarray(cupy.tril_indices(nao_cart)[0]),
+        "idy": cupy.asarray(cupy.tril_indices(nao_cart)[1]),
+        "ht2ao": None,
+        "eri_buf": None,
+        "max_block_ao": max_block_ao,
     }
 
 
@@ -169,7 +205,12 @@ def _add_vvvv_gpu_lambda_only(mycc, l2, imds=None):
     nocc = l2.shape[0]
     nvir = l2.shape[2]
     ctx = None if imds is None else getattr(imds, "lambda_vvvv_ctx", None)
-    if ctx is None or ctx["nocc"] != nocc or ctx["nvir"] != nvir:
+    if (
+        ctx is None
+        or ctx["nocc"] != nocc
+        or ctx["nvir"] != nvir
+        or ctx.get("dtype") != l2.dtype
+    ):
         ctx = _build_lambda_vvvv_context(mycc, l2, gpu_ccsd_incore)
         if imds is not None:
             imds.lambda_vvvv_ctx = ctx
@@ -180,14 +221,19 @@ def _add_vvvv_gpu_lambda_only(mycc, l2, imds=None):
     ao_loc = ctx["ao_loc"]
     cp_idx = ctx["cp_idx"]
     cp_jdx = ctx["cp_jdx"]
-    nao = mo.shape[0]
-    nocc2 = nocc * (nocc + 1) // 2
+    nao = ctx["nao"]
+    nocc2 = ctx["nocc2"]
 
     tau = cupy.asarray(l2)[cupy.tril_indices(nocc)]
     x2 = cupy.einsum("xab,pa->xpb", tau, orbv)
     x2 = cupy.einsum("xpb,qb->xpq", x2, orbv)
     x2 = cupy.asarray(x2, order="C")
-    ht2ao = cupy.zeros_like(x2)
+    ht2ao = ctx.get("ht2ao")
+    if ht2ao is None or ht2ao.shape != x2.shape or ht2ao.dtype != x2.dtype:
+        ht2ao = cupy.zeros_like(x2)
+        ctx["ht2ao"] = ht2ao
+    else:
+        ht2ao.fill(0)
 
     handle = cupy.cuda.device.get_cublas_handle()
     dgemm = cupy.cuda.cublas.dgemm
@@ -240,8 +286,14 @@ def _add_vvvv_gpu_lambda_only(mycc, l2, imds=None):
     if vhfopt.uniq_l_ctr[:, 0].max() > gpu_ccsd_incore.int4c2e.LMAX_ON_GPU:
         raise RuntimeError("lambda-only gpu direct vvvv does not support host integral fallback")
 
-    idx, idy = cupy.tril_indices(nao)
+    idx = ctx["idx"]
+    idy = ctx["idy"]
     l_ctr_offsets = vhfopt.l_ctr_offsets
+    eri_buf = ctx.get("eri_buf")
+    eri_buf_shape = (ctx["max_block_ao"], nao, ctx["max_block_ao"], nao)
+    if eri_buf is None or eri_buf.shape != eri_buf_shape or eri_buf.dtype != l2.dtype:
+        eri_buf = cupy.empty(eri_buf_shape, dtype=l2.dtype)
+        ctx["eri_buf"] = eri_buf
     for cp_ij_id, log_q_ij in enumerate(vhfopt.log_qs):
         cpi = cp_idx[cp_ij_id]
         cpj = cp_jdx[cp_ij_id]
@@ -257,7 +309,8 @@ def _add_vvvv_gpu_lambda_only(mycc, l2, imds=None):
         jsh1 = l_ctr_offsets[cpj + 1]
         i0, i1 = ao_loc[ish0], ao_loc[ish1]
         j0, j1 = ao_loc[jsh0], ao_loc[jsh1]
-        eri = cupy.zeros((i1 - i0, nao, j1 - j0, nao))
+        eri = eri_buf[: i1 - i0, :, : j1 - j0, :]
+        eri.fill(0)
         strides = [1, (j1 - j0) * nao, (j1 - j0) * nao**2, nao]
         gpu_ccsd_incore._fill_eri_block(eri, strides, [0, 0, i0, j0], vhfopt, cp_ij_id)
         eri[:, idx, :, idy] = eri[:, idy, :, idx]
@@ -265,7 +318,8 @@ def _add_vvvv_gpu_lambda_only(mycc, l2, imds=None):
 
     ht2tril = cupy.einsum("xpq,pa->xaq", ht2ao, orbv)
     ht2tril = cupy.einsum("xaq,qb->xab", ht2tril, orbv)
-    if gpu_ccsd_incore.FREE_CUPY_CACHE:
+    free_gpu_cache = getattr(mycc, "_lambda_free_gpu_cache", False)
+    if free_gpu_cache:
         cupy.get_default_memory_pool().free_all_blocks()
     return gpu_ccsd_incore._unpack_t2_tril(ht2tril, nocc, nvir)
 
@@ -278,7 +332,11 @@ def _add_vvvv_gpu(mycc, l2, eris, log, imds=None):
     ``Ht2 = einsum('ijcd,acdb->ijab', l2, vvvv)`` piece required by the
     lambda equations.
     """
-    if getattr(eris, "vvvv", None) is not None:
+    strategy = getattr(mycc, "_lambda_vvvv_strategy", "auto")
+    if strategy == "cpu":
+        raise RuntimeError("cpu strategy requested through GPU helper")
+
+    if getattr(eris, "vvvv", None) is not None and strategy in ("auto", "dense-prepacked"):
         try:
             return cupy.asarray(_add_vvvv_gpu_dense_prepacked(mycc, l2, eris, imds=imds))
         except Exception as exc:
@@ -287,18 +345,28 @@ def _add_vvvv_gpu(mycc, l2, eris, log, imds=None):
     if _get_gpu_direct_vvvv() is False:
         raise RuntimeError("gpu4pyscf direct vvvv helper is unavailable")
 
-    try:
-        l2new = _add_vvvv_gpu_lambda_only(mycc, l2, imds=imds)
-    except Exception as exc:
-        log.debug1("lambda-only gpu direct vvvv failed; trying full helper: %s", exc)
-        direct_vvvv = _get_gpu_direct_vvvv()
+    direct_vvvv = _get_gpu_direct_vvvv()
+
+    def _full_helper():
         nocc, nvir = l2.shape[0], l2.shape[2]
         zero_t1 = cupy.zeros((nocc, nvir), dtype=l2.dtype)
+        _, _, out, _, _ = direct_vvvv(mycc, zero_t1, l2)
+        return out
+
+    if strategy == "full-helper":
+        l2new = _full_helper()
+    elif strategy == "lambda-only":
+        l2new = _add_vvvv_gpu_lambda_only(mycc, l2, imds=imds)
+    else:
         try:
-            _, _, l2new, _, _ = direct_vvvv(mycc, zero_t1, l2)
-        except Exception as exc2:
-            log.debug1("gpu direct vvvv failed; falling back to CPU helper: %s", exc2)
-            raise
+            l2new = _add_vvvv_gpu_lambda_only(mycc, l2, imds=imds)
+        except Exception as exc:
+            log.debug1("lambda-only gpu direct vvvv failed; trying full helper: %s", exc)
+            try:
+                l2new = _full_helper()
+            except Exception as exc2:
+                log.debug1("gpu direct vvvv failed; falling back to CPU helper: %s", exc2)
+                raise
     return cupy.asarray(l2new)
 
 
@@ -308,7 +376,11 @@ def _build_vvov_slice(ovvv_blocks_cpu, p0, p1, nvir, nocc, dtype):
     q0 = 0
     for block in ovvv_blocks_cpu:
         q1 = q0 + block.shape[3]
-        eris_vvov[:, :, :, q0:q1] = cupy.asarray(block[p0:p1], dtype=dtype)
+        chunk = block[p0:p1]
+        if cupy is not None and isinstance(chunk, cupy.ndarray):
+            eris_vvov[:, :, :, q0:q1] = chunk.astype(dtype, copy=False)
+        else:
+            eris_vvov[:, :, :, q0:q1] = cupy.asarray(chunk, dtype=dtype)
         q0 = q1
     return eris_vvov
 
@@ -359,19 +431,19 @@ def _prepare_virtual_block_cache(eris, nvir, blksize):
     """
     cache = []
     for p0, p1 in lib.prange(0, nvir, blksize):
-        ovvv = numpy.asarray(eris.get_ovvv(slice(None), slice(p0, p1)), order="C")
-        ovoo = numpy.asarray(eris.ovoo[:, p0:p1], order="C")
-        ovvo = numpy.asarray(eris.ovvo[:, p0:p1], order="C")
-        oovv = numpy.asarray(eris.oovv[:, :, p0:p1], order="C")
+        ovvv = _as_c_order_preserve_backend(eris.get_ovvv(slice(None), slice(p0, p1)))
+        ovoo = _as_c_order_preserve_backend(eris.ovoo[:, p0:p1])
+        ovvo = _as_c_order_preserve_backend(eris.ovvo[:, p0:p1])
+        oovv = _as_c_order_preserve_backend(eris.oovv[:, :, p0:p1])
         cache.append(
             {
                 "p0": p0,
                 "p1": p1,
                 "ovvv": ovvv,
-                "vvov": ovvv.transpose(2, 3, 0, 1).copy(),
+                "vvov": _as_c_order_preserve_backend(ovvv.transpose(2, 3, 0, 1)),
                 "ovoo": ovoo,
-                "ovvo_t": ovvo.transpose(1, 0, 3, 2).copy(),
-                "oovv_t": oovv.transpose(2, 1, 0, 3).copy(),
+                "ovvo_t": _as_c_order_preserve_backend(ovvo.transpose(1, 0, 3, 2)),
+                "oovv_t": _as_c_order_preserve_backend(oovv.transpose(2, 1, 0, 3)),
             }
         )
     return cache
@@ -701,7 +773,7 @@ def kernel_gpu(
     max_cycle=None,
     tol=None,
     verbose=logger.INFO,
-    use_cpu_vvvv=False,
+    use_cpu_vvvv=None,
 ):
     if eris is None:
         eris = mycc.ao2mo()
@@ -720,6 +792,8 @@ def kernel_gpu(
         max_cycle = mycc.max_cycle
     if tol is None:
         tol = mycc.conv_tol_normt
+    if use_cpu_vvvv is None:
+        use_cpu_vvvv = _should_default_cpu_vvvv(mycc, t1, eris)
 
     t1_gpu = _to_gpu(t1)
     t2_gpu = _to_gpu(t2)
@@ -769,7 +843,8 @@ def solve_lambda_gpu(
     l1=None,
     l2=None,
     eris=None,
-    use_cpu_vvvv=False,
+    use_cpu_vvvv=None,
+    vvvv_strategy=None,
     fallback_to_cpu=True,
 ):
     """Solve CCSD lambda with GPU-ported dominant contractions.
@@ -777,6 +852,15 @@ def solve_lambda_gpu(
     The solver updates ``mycc.converged_lambda``, ``mycc.l1`` and ``mycc.l2``
     to match the standard PySCF ``solve_lambda`` side effects.
     """
+    prev_strategy = getattr(mycc, "_lambda_vvvv_strategy", None)
+    if t1 is None:
+        t1 = mycc.t1
+    if eris is None:
+        eris = mycc.ao2mo()
+    if use_cpu_vvvv is None:
+        use_cpu_vvvv = _should_default_cpu_vvvv(mycc, t1, eris)
+    if vvvv_strategy is not None:
+        mycc._lambda_vvvv_strategy = vvvv_strategy
     if _has_usable_gpu():
         try:
             conv, l1_out, l2_out = kernel_gpu(
@@ -794,14 +878,27 @@ def solve_lambda_gpu(
             mycc.converged_lambda = conv
             mycc.l1 = l1_out
             mycc.l2 = l2_out
-            mycc._lambda_solver_mode = "gpu-hybrid"
+            mycc._lambda_solver_mode = "gpu-hybrid-cpu-vvvv" if use_cpu_vvvv else "gpu-hybrid"
+            mycc._lambda_vvvv_mode = "cpu" if use_cpu_vvvv else "gpu"
             return mycc.l1, mycc.l2
         except Exception:
             if not fallback_to_cpu:
                 raise
+        finally:
+            if vvvv_strategy is not None:
+                if prev_strategy is None:
+                    delattr(mycc, "_lambda_vvvv_strategy")
+                else:
+                    mycc._lambda_vvvv_strategy = prev_strategy
 
     if not fallback_to_cpu:
         raise RuntimeError("No usable CuPy GPU runtime found for lambda solve.")
+    if vvvv_strategy is not None:
+        if prev_strategy is None and hasattr(mycc, "_lambda_vvvv_strategy"):
+            delattr(mycc, "_lambda_vvvv_strategy")
+        elif prev_strategy is not None:
+            mycc._lambda_vvvv_strategy = prev_strategy
     mycc._lambda_solver_mode = "cpu-fallback"
+    mycc._lambda_vvvv_mode = "cpu"
     mycc.l1, mycc.l2 = mycc.solve_lambda(t1=t1, t2=t2, l1=l1, l2=l2, eris=eris)
     return mycc.l1, mycc.l2
