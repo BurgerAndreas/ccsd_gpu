@@ -3,6 +3,7 @@ import time
 
 import numpy as np
 from pyscf import gto, scf
+from pyscf.lib import logger
 
 from ccsd_gpu import (
     cc,
@@ -57,7 +58,7 @@ def to_numpy(x):
 
 def restore_ccsd_solver(mf, t1, t2, e_corr, max_memory_mb, l1=None, l2=None):
     mycc = pyscf_cc.CCSD(mf)
-    mycc.verbose = 0
+    mycc.verbose = logger.INFO
     mycc.max_memory = max_memory_mb
     mycc.t1 = t1
     mycc.t2 = t2

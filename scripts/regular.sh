@@ -69,6 +69,10 @@ else
       shift
       CMD=(python examples/h2o_ccsd_grad.py --molecule h2o "$@")
       ;;
+    test-aniline-parity)
+      shift
+      CMD=(python tests/test_aniline_parity.py "$@")
+      ;;
     *)
       CMD=("$@")
       ;;
@@ -78,7 +82,7 @@ fi
 echo "Running: uv run ${CMD[*]}"
 echo "============================================"
 
-srun uv run "${CMD[@]}"
+srun --ntasks=1 --cpus-per-task="${SLURM_CPUS_PER_TASK:-1}" --cpu-bind=none uv run "${CMD[@]}"
 
 echo "============================================"
 echo "Complete!"

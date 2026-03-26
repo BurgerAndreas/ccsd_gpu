@@ -25,7 +25,9 @@ import cupy
 _GPU_JK_NAO_THRESHOLD = 200
 
 from pyscf import lib
+from pyscf.cc import ccsd_rdm
 from pyscf.lib import logger
+from pyscf.grad import ccsd as ccsd_grad
 from pyscf.scf import cphf
 from pyscf.grad import rhf as rhf_grad
 from pyscf.grad.mp2 import _shell_prange, _index_frozen_active, has_frozen_orbitals
@@ -586,6 +588,223 @@ def grad_elec_gpu(mycc, t1, t2, l1, l2, atmlst=None, verbose=logger.INFO):
     return de
 
 
+def grad_elec_gpu_blocked(mycc, t1, t2, l1, l2, atmlst=None, verbose=logger.INFO):
+    """Blocked CCSD electronic gradient.
+
+    This path avoids materializing full ``dvvvv`` and full MO/AO ``dm2`` on GPU.
+    It uses PySCF's out-of-core 2-RDM assembly to write packed ``dm2`` to HDF5,
+    then streams AO-pair blocks into the existing GPU contraction loop.
+    """
+    log = logger.new_logger(mycc, verbose)
+    time0 = logger.process_clock(), logger.perf_counter()
+
+    log.debug("Build ccsd rdm1 intermediates (GPU)")
+    d1 = _gamma1_intermediates_gpu(mycc, t1, t2, l1, l2)
+    doo, dov, dvo, dvv = d1
+    time1 = log.timer_debug1("rdm1 intermediates (GPU)", *time0)
+
+    mol = mycc.mol
+    mo_coeff = mycc.mo_coeff
+    mo_energy = mycc._scf.mo_energy
+    nao, nmo = mo_coeff.shape
+    nocc = numpy.count_nonzero(mycc.mo_occ > 0)
+    with_frozen = has_frozen_orbitals(mycc)
+    OA, VA, OF, VF = _index_frozen_active(mycc.get_frozen_mask(), mycc.mo_occ)
+
+    log.debug("Build blocked rdm2 intermediates (CPU outcore)")
+    fdm2 = lib.H5TmpFile()
+    d2 = ccsd_rdm._gamma2_outcore(
+        mycc,
+        numpy.asarray(t1),
+        numpy.asarray(t2),
+        numpy.asarray(l1),
+        numpy.asarray(l2),
+        fdm2,
+        True,
+    )
+    time1 = log.timer_debug1("rdm2 intermediates (blocked)", *time1)
+
+    log.debug("Blocked MO->AO transformation")
+    mo_active = mo_coeff[:, numpy.hstack((OA, VA))]
+    ccsd_grad._rdm2_mo2ao(mycc, d2, mo_active, fdm2)
+    time1 = log.timer_debug1("MO->AO transformation (blocked)", *time1)
+
+    hf_dm1 = mycc._scf.make_rdm1(mycc.mo_coeff, mycc.mo_occ)
+    hf_dm1_gpu = cupy.asarray(hf_dm1)
+
+    if atmlst is None:
+        atmlst = range(mol.natm)
+    offsetdic = mol.offset_nr_by_atom()
+    diagidx = numpy.arange(nao)
+    diagidx = diagidx * (diagidx + 1) // 2 + diagidx
+    diagidx_gpu = cupy.asarray(diagidx)
+    de = numpy.zeros((len(atmlst), 3))
+    vhf1 = numpy.zeros((len(atmlst), 3, nao, nao))
+
+    tril_row, tril_col = cupy.tril_indices(nao)
+    nao_pair = nao * (nao + 1) // 2
+    offdiag_p = tril_row != tril_col
+    _pidx = cupy.arange(nao_pair)
+    I_row = cupy.zeros((nao, nao_pair), dtype=cupy.float64)
+    I_row[tril_row, _pidx] = 1.0
+    I_col = cupy.zeros((nao, nao_pair), dtype=cupy.float64)
+    I_col[tril_col, _pidx] = 1.0
+    I_col_od = I_col * offdiag_p[None, :]
+
+    v_hf_dm = hf_dm1_gpu[tril_row, tril_col].copy()
+    v_hf_dm[offdiag_p] += hf_dm1_gpu[tril_col[offdiag_p], tril_row[offdiag_p]]
+    P_krow = hf_dm1_gpu[:, tril_row]
+    P_lcol = hf_dm1_gpu[:, tril_col]
+
+    max_memory = max(0, mycc.max_memory - lib.current_memory()[0])
+    blksize = max(1, int(max_memory * 0.9e6 / 8 / (nao**3 * 2.5)))
+    Imat_gpu = cupy.zeros((nao, nao))
+
+    for k, ia in enumerate(atmlst):
+        shl0, shl1, p0, p1 = offsetdic[ia]
+        ip1 = p0
+        vhf_gpu = cupy.zeros((3, nao, nao))
+        de_k_gpu = cupy.zeros(3)
+        for b0, b1, nf in _shell_prange(mol, shl0, shl1, blksize):
+            ip0, ip1 = ip1, ip1 + nf
+            dm2buf = _load_block_tril(fdm2["dm2"], ip0, ip1, nao)
+            dm2buf_gpu = cupy.asarray(dm2buf)
+            dm2buf_gpu[:, :, diagidx_gpu] *= 0.5
+
+            shls_slice = (b0, b1, 0, mol.nbas, 0, mol.nbas, 0, mol.nbas)
+            if _check_gpu_int2e() and nao >= _GPU_INT2E_NAO_THRESHOLD and _gpu_int2e._check_mol(mol):
+                eri0_gpu = _gpu_int2e.compute_int2e_gpu(mol, b0, b1)
+            else:
+                eri0 = mol.intor("int2e", aosym="s2kl", shls_slice=shls_slice)
+                eri0_gpu = cupy.asarray(eri0.reshape(nf, nao, -1))
+            eri0_2d = eri0_gpu.transpose(1, 0, 2).reshape(nao, nf * nao_pair)
+            dm2_2d = dm2buf_gpu.transpose(1, 0, 2).reshape(nao, nf * nao_pair)
+            Imat_gpu += eri0_2d @ dm2_2d.T
+            eri0_gpu = eri0_2d = dm2_2d = None
+
+            if _check_gpu_int2e_ip1() and nao >= _GPU_INT2E_IP1_NAO_THRESHOLD and _gpu_int2e_ip1._check_mol(mol):
+                eri1_gpu = _gpu_int2e_ip1.compute_int2e_ip1_gpu(mol, b0, b1)
+                eri1_gpu = eri1_gpu.reshape(3, nf, nao, -1)
+            else:
+                eri1 = mol.intor(
+                    "int2e_ip1", comp=3, aosym="s2kl", shls_slice=shls_slice
+                ).reshape(3, nf, nao, -1)
+                eri1_gpu = cupy.asarray(eri1)
+
+            de_k_gpu -= eri1_gpu.reshape(3, -1) @ dm2buf_gpu.reshape(-1) * 2
+            dm2buf_gpu = None
+
+            D = hf_dm1_gpu[ip0:ip1]
+            D_col = D[:, tril_col]
+            D_row = D[:, tril_row]
+            for comp in range(3):
+                ec = eri1_gpu[comp]
+                W = ec.reshape(nf * nao, nao_pair).T @ D.reshape(nf * nao)
+                R = cupy.zeros((nao, nao), dtype=cupy.float64)
+                R[tril_row, tril_col] = W
+                R[tril_col, tril_row] = W
+                vhf_gpu[comp] += R
+
+                A = cupy.einsum("ijp,ip->jp", ec, D_col)
+                B = cupy.einsum("ijp,ip->jp", ec, D_row)
+                vhf_gpu[comp] -= 0.5 * (I_row @ A.T + I_col_od @ B.T)
+
+                vhf_gpu[comp, ip0:ip1] += (
+                    ec.reshape(nf * nao, nao_pair) @ v_hf_dm
+                ).reshape(nf, nao)
+
+                E = cupy.einsum("ijp,jp->ip", ec, P_krow)
+                F = cupy.einsum("ijp,jp->ip", ec, P_lcol)
+                vhf_gpu[comp, ip0:ip1] -= 0.5 * (
+                    E @ I_col.T + (F * offdiag_p[None, :]) @ I_row.T
+                )
+            eri1_gpu = None
+        de[k] += cupy.asnumpy(de_k_gpu)
+        vhf1[k] = cupy.asnumpy(vhf_gpu)
+        log.debug("2e-part grad of atom %d %s = %s", ia, mol.atom_symbol(ia), de[k])
+        time1 = log.timer_debug1("2e-part grad of atom %d" % ia, *time1)
+
+    Imat = cupy.asnumpy(Imat_gpu)
+    Imat_gpu = None
+
+    doo_np = cupy.asnumpy(doo)
+    dvv_np = cupy.asnumpy(dvv)
+
+    Imat = reduce(numpy.dot, (mo_coeff.T, Imat, mycc._scf.get_ovlp(), mo_coeff)) * -1
+
+    dm1mo = numpy.zeros((nmo, nmo))
+    if with_frozen:
+        dco = Imat[OF[:, None], OA] / (mo_energy[OF, None] - mo_energy[OA])
+        dfv = Imat[VF[:, None], VA] / (mo_energy[VF, None] - mo_energy[VA])
+        dm1mo[OA[:, None], OA] = doo_np + doo_np.T
+        dm1mo[OF[:, None], OA] = dco
+        dm1mo[OA[:, None], OF] = dco.T
+        dm1mo[VA[:, None], VA] = dvv_np + dvv_np.T
+        dm1mo[VF[:, None], VA] = dfv
+        dm1mo[VA[:, None], VF] = dfv.T
+    else:
+        dm1mo[:nocc, :nocc] = doo_np + doo_np.T
+        dm1mo[nocc:, nocc:] = dvv_np + dvv_np.T
+
+    global _gpu_jk, _GPU_JK_AVAILABLE
+    if _check_gpu_jk() and nao >= _GPU_JK_NAO_THRESHOLD:
+        try:
+            _vhfopt = _gpu_jk._VHFOpt(mol).build()
+        except Exception:
+            _vhfopt = None
+            _GPU_JK_AVAILABLE = False
+    else:
+        _vhfopt = None
+
+    dm1 = reduce(numpy.dot, (mo_coeff, dm1mo, mo_coeff.T))
+    if _vhfopt is not None:
+        vj, vk = _gpu_jk.get_jk(mol, cupy.asarray(dm1), hermi=1, vhfopt=_vhfopt)
+        vhf = cupy.asnumpy(vj - vk * 0.5) * 2
+    else:
+        vhf = mycc._scf.get_veff(mycc.mol, dm1) * 2
+    Xvo = reduce(numpy.dot, (mo_coeff[:, nocc:].T, vhf, mo_coeff[:, :nocc]))
+    Xvo += Imat[:nocc, nocc:].T - Imat[nocc:, :nocc]
+
+    dm1mo += _response_dm1_gpu(mycc, Xvo, _vhfopt)
+    time1 = log.timer_debug1("response_rdm1 intermediates", *time1)
+
+    Imat[nocc:, :nocc] = Imat[:nocc, nocc:].T
+    im1 = reduce(numpy.dot, (mo_coeff, Imat, mo_coeff.T))
+    time1 = log.timer_debug1("response_rdm1", *time1)
+
+    mf_grad = mycc._scf.nuc_grad_method()
+    hcore_deriv = mf_grad.hcore_generator(mol)
+    s1 = mf_grad.get_ovlp(mol)
+
+    zeta = lib.direct_sum("i+j->ij", mo_energy, mo_energy) * 0.5
+    zeta[nocc:, :nocc] = mo_energy[:nocc]
+    zeta[:nocc, nocc:] = mo_energy[:nocc].reshape(-1, 1)
+    zeta = reduce(numpy.dot, (mo_coeff, zeta * dm1mo, mo_coeff.T))
+
+    dm1 = reduce(numpy.dot, (mo_coeff, dm1mo, mo_coeff.T))
+    p1 = numpy.dot(mo_coeff[:, :nocc], mo_coeff[:, :nocc].T)
+    vhf_s1occ = reduce(numpy.dot, (p1, mycc._scf.get_veff(mol, dm1 + dm1.T), p1))
+    time1 = log.timer_debug1("h1 and JK1", *time1)
+
+    dm1p = hf_dm1 + dm1 * 2
+    dm1 += hf_dm1
+    zeta += rhf_grad.make_rdm1e(mo_energy, mo_coeff, mycc.mo_occ)
+
+    for k, ia in enumerate(atmlst):
+        shl0, shl1, p0, p1 = offsetdic[ia]
+        de[k] += numpy.einsum("xij,ij->x", s1[:, p0:p1], im1[p0:p1])
+        de[k] += numpy.einsum("xji,ij->x", s1[:, p0:p1], im1[:, p0:p1])
+        h1ao = hcore_deriv(ia)
+        de[k] += numpy.einsum("xij,ji->x", h1ao, dm1)
+        de[k] -= numpy.einsum("xij,ij->x", s1[:, p0:p1], zeta[p0:p1])
+        de[k] -= numpy.einsum("xji,ij->x", s1[:, p0:p1], zeta[:, p0:p1])
+        de[k] -= numpy.einsum("xij,ij->x", s1[:, p0:p1], vhf_s1occ[p0:p1]) * 2
+        de[k] -= numpy.einsum("xij,ij->x", vhf1[k], dm1p)
+
+    log.timer("%s GPU gradients (blocked dm2)" % mycc.__class__.__name__, *time0)
+    return de
+
+
 def _response_dm1_cpu(mycc, Xvo, eris=None):
     """CPU CPHF solver — same as pyscf.grad.ccsd._response_dm1."""
     nvir, nocc = Xvo.shape
@@ -703,6 +922,41 @@ def _load_block_tril(h5dat, row0, row1, nao, out=None):
     return out
 
 
+def _estimate_grad_gpu_memory_bytes(nocc, nvir, dtype):
+    itemsize = numpy.dtype(dtype).itemsize
+    nmo = nocc + nvir
+    dvvvv_bytes = nvir**4 * itemsize
+    dm2_bytes = nmo**4 * itemsize
+    return {
+        "dvvvv_bytes": dvvvv_bytes,
+        "dm2_bytes": dm2_bytes,
+        # The current GPU implementation materializes both plus additional
+        # intermediates, so use a conservative combined peak estimate.
+        "peak_bytes": dvvvv_bytes + dm2_bytes,
+    }
+
+
+def _should_fallback_grad_to_cpu(t1):
+    nocc, nvir = t1.shape
+    estimate = _estimate_grad_gpu_memory_bytes(nocc, nvir, t1.dtype)
+    try:
+        free_bytes = int(cupy.cuda.runtime.memGetInfo()[0])
+    except Exception:
+        return True, "GPU memory unavailable", estimate
+
+    # Leave headroom for amplitudes, CuPy pool fragmentation, and the AO
+    # integral contraction buffers used later in the gradient.
+    safe_budget = int(free_bytes * 0.5)
+    if estimate["peak_bytes"] > safe_budget:
+        gib = 1024**3
+        reason = (
+            f"estimated GPU grad peak {estimate['peak_bytes']/gib:.1f} GiB exceeds "
+            f"safe budget {safe_budget/gib:.1f} GiB"
+        )
+        return True, reason, estimate
+    return False, "", estimate
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -730,7 +984,24 @@ def compute_ml_ccsd_forces_gpu(mf, t1, t2, l1, l2):
     mycc.converged = True
     mycc.converged_lambda = True
 
-    de = grad_elec_gpu(mycc, t1, t2, l1, l2, verbose=0)
+    fallback_to_blocked, fallback_reason, estimate = _should_fallback_grad_to_cpu(t1)
+    if fallback_to_blocked:
+        mycc._grad_solver_mode = "gpu-blocked-dm2"
+        mycc._grad_solver_reason = fallback_reason
+        mycc._grad_gpu_memory_estimate = estimate
+        de = grad_elec_gpu_blocked(mycc, t1, t2, l1, l2, verbose=0)
+    else:
+        try:
+            de = grad_elec_gpu(mycc, t1, t2, l1, l2, verbose=0)
+            mycc._grad_solver_mode = "gpu"
+            mycc._grad_gpu_memory_estimate = estimate
+        except cupy.cuda.runtime.CUDARuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            mycc._grad_solver_mode = "gpu-blocked-dm2"
+            mycc._grad_solver_reason = f"GPU OOM during grad_elec_gpu: {exc}"
+            mycc._grad_gpu_memory_estimate = estimate
+            de = grad_elec_gpu_blocked(mycc, t1, t2, l1, l2, verbose=0)
 
     # Add nuclear repulsion gradient
     mf_grad = mf.nuc_grad_method()

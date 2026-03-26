@@ -13,10 +13,11 @@ on GPU and provides a drop-in local path for analytic gradient work.
 """
 
 from functools import reduce
+import time
 
 import numpy
 
-from pyscf import lib
+from pyscf import ao2mo, lib
 from pyscf.cc import ccsd
 from pyscf.lib import logger
 
@@ -26,7 +27,7 @@ except Exception:  # pragma: no cover - exercised through CPU fallback
     cupy = None
 
 
-_GPU_DIRECT_VVVV = None
+_GPU_CCSD_INCORE = None
 
 
 def _has_usable_gpu():
@@ -55,17 +56,24 @@ def _as_cupy_c_order(a):
     return cupy.asarray(numpy.asarray(a, order="C"))
 
 
-def _get_gpu_direct_vvvv():
-    global _GPU_DIRECT_VVVV
-    if _GPU_DIRECT_VVVV is not None:
-        return _GPU_DIRECT_VVVV
+def _get_gpu_ccsd_incore():
+    global _GPU_CCSD_INCORE
+    if _GPU_CCSD_INCORE is not None:
+        return _GPU_CCSD_INCORE
     try:
         from gpu4pyscf.cc import ccsd_incore as gpu_ccsd_incore
 
-        _GPU_DIRECT_VVVV = gpu_ccsd_incore._direct_ovvv_vvvv
+        _GPU_CCSD_INCORE = gpu_ccsd_incore
     except Exception:
-        _GPU_DIRECT_VVVV = False
-    return _GPU_DIRECT_VVVV
+        _GPU_CCSD_INCORE = False
+    return _GPU_CCSD_INCORE
+
+
+def _get_gpu_direct_vvvv():
+    gpu_ccsd_incore = _get_gpu_ccsd_incore()
+    if gpu_ccsd_incore is False:
+        return False
+    return gpu_ccsd_incore._direct_ovvv_vvvv
 
 
 def _gpu_block_size(mycc, nocc, nvir, tensor_factor):
@@ -82,7 +90,187 @@ class _IMDS:
     pass
 
 
-def _add_vvvv_gpu(mycc, l2, log):
+def _build_dense_vvvv_prepacked_rhs(eris, nvir, dtype):
+    vvvv = numpy.asarray(eris.vvvv)
+    if vvvv.ndim == 2:
+        vvvv = ao2mo.restore(1, vvvv, nvir)
+    elif vvvv.ndim != 4:
+        raise RuntimeError(f"Unsupported explicit vvvv rank: {vvvv.ndim}")
+    rhs = vvvv.transpose(1, 2, 0, 3).reshape(nvir * nvir, nvir * nvir)
+    return cupy.asarray(numpy.asarray(rhs, order="C"), dtype=dtype)
+
+
+def _add_vvvv_gpu_dense_prepacked(mycc, l2, eris, imds=None):
+    nocc, nvir = l2.shape[0], l2.shape[2]
+    itemsize = numpy.dtype(l2.dtype).itemsize
+    rhs_bytes = nvir**4 * itemsize
+    free_gpu_bytes = int(cupy.cuda.runtime.memGetInfo()[0])
+    cpu_budget_bytes = int(max(0, mycc.max_memory - lib.current_memory()[0]) * 0.95e6)
+    if rhs_bytes > free_gpu_bytes * 0.30:
+        raise RuntimeError("explicit dense-prepacked vvvv exceeds safe GPU memory budget")
+    if cpu_budget_bytes > 0 and rhs_bytes > cpu_budget_bytes * 0.50:
+        raise RuntimeError("explicit dense-prepacked vvvv exceeds safe CPU memory budget")
+
+    rhs = None if imds is None else getattr(imds, "dense_vvvv_rhs", None)
+    rhs_shape = (nvir * nvir, nvir * nvir)
+    if rhs is None or rhs.shape != rhs_shape or rhs.dtype != l2.dtype:
+        rhs = _build_dense_vvvv_prepacked_rhs(eris, nvir, l2.dtype)
+        if imds is not None:
+            imds.dense_vvvv_rhs = rhs
+
+    lhs = l2.reshape(nocc * nocc, nvir * nvir)
+    return (lhs @ rhs).reshape(nocc, nocc, nvir, nvir)
+
+
+def _build_lambda_vvvv_context(mycc, l2, gpu_ccsd_incore):
+    nocc = l2.shape[0]
+    nao_cart = mycc.mol.nao_nr(cart=True)
+    max_memory = max(gpu_ccsd_incore.MEMORYMIN, mycc.max_memory - lib.current_memory()[0])
+    blksize = ((max_memory * 0.9e6 - l2.size * 4 * 8) / 8 / nao_cart**2 / 3.5) ** 0.5
+    nocc2 = nocc * (nocc + 1) // 2
+    ht2_mem = nocc2 * nao_cart**2 * 8 * 2
+    mem_avail = int(cupy.cuda.runtime.memGetInfo()[0] * 0.75)
+    if mem_avail * 0.9 < ht2_mem:
+        raise RuntimeError(
+            f"Not enough GPU memory. Available {mem_avail*1e-6} MB, required {ht2_mem/.9e-6} MB"
+        )
+    cupy.get_default_memory_pool().set_limit(mem_avail)
+    blksize = max(
+        gpu_ccsd_incore.BLKMIN,
+        int(
+            min(
+                (nao_cart + 3) / 4,
+                blksize,
+                ((mem_avail - ht2_mem) * 0.5 / 8 / nao_cart**2) ** 0.5,
+            )
+        ),
+    )
+    vhfopt = gpu_ccsd_incore.int4c2e._VHFOpt(mycc.mol, "int2e")
+    vhfopt.build(group_size=blksize, diag_block_with_triu=True)
+    mo = vhfopt.coeff.dot(cupy.asarray(mycc.mo_coeff))
+    cp_idx, cp_jdx = numpy.tril_indices(len(vhfopt.uniq_l_ctr))
+    return {
+        "nocc": nocc,
+        "nvir": l2.shape[2],
+        "vhfopt": vhfopt,
+        "mo": mo,
+        "orbv": cupy.asarray(mo[:, nocc:]),
+        "ao_loc": vhfopt.mol.ao_loc,
+        "cp_idx": cp_idx,
+        "cp_jdx": cp_jdx,
+    }
+
+
+def _add_vvvv_gpu_lambda_only(mycc, l2, imds=None):
+    gpu_ccsd_incore = _get_gpu_ccsd_incore()
+    if gpu_ccsd_incore is False:
+        raise RuntimeError("gpu4pyscf direct vvvv helper is unavailable")
+
+    nocc = l2.shape[0]
+    nvir = l2.shape[2]
+    ctx = None if imds is None else getattr(imds, "lambda_vvvv_ctx", None)
+    if ctx is None or ctx["nocc"] != nocc or ctx["nvir"] != nvir:
+        ctx = _build_lambda_vvvv_context(mycc, l2, gpu_ccsd_incore)
+        if imds is not None:
+            imds.lambda_vvvv_ctx = ctx
+
+    vhfopt = ctx["vhfopt"]
+    mo = ctx["mo"]
+    orbv = ctx["orbv"]
+    ao_loc = ctx["ao_loc"]
+    cp_idx = ctx["cp_idx"]
+    cp_jdx = ctx["cp_jdx"]
+    nao = mo.shape[0]
+    nocc2 = nocc * (nocc + 1) // 2
+
+    tau = cupy.asarray(l2)[cupy.tril_indices(nocc)]
+    x2 = cupy.einsum("xab,pa->xpb", tau, orbv)
+    x2 = cupy.einsum("xpb,qb->xpq", x2, orbv)
+    x2 = cupy.asarray(x2, order="C")
+    ht2ao = cupy.zeros_like(x2)
+
+    handle = cupy.cuda.device.get_cublas_handle()
+    dgemm = cupy.cuda.cublas.dgemm
+    op_n = cupy.cuda.cublas.CUBLAS_OP_N
+    op_t = cupy.cuda.cublas.CUBLAS_OP_T
+    one = numpy.ones(1)
+    one_ptr = one.ctypes.data
+    x2_ptr = int(x2.data.ptr)
+    ht2ao_ptr = int(ht2ao.data.ptr)
+    nao2 = nao * nao
+
+    def contract_vvvv_block(eri, i0, i1, j0, j1):
+        ic = i1 - i0
+        jc = j1 - j0
+        eri = eri.reshape(-1, jc * nao)
+        dgemm(
+            handle,
+            op_n,
+            op_n,
+            jc * nao,
+            nocc2,
+            ic * nao,
+            one_ptr,
+            eri.data.ptr,
+            jc * nao,
+            x2_ptr + i0 * nao * 8,
+            nao2,
+            one_ptr,
+            ht2ao_ptr + j0 * nao * 8,
+            nao2,
+        )
+        if i0 > j0:
+            dgemm(
+                handle,
+                op_t,
+                op_n,
+                ic * nao,
+                nocc2,
+                jc * nao,
+                one_ptr,
+                eri.data.ptr,
+                jc * nao,
+                x2_ptr + j0 * nao * 8,
+                nao2,
+                one_ptr,
+                ht2ao_ptr + i0 * nao * 8,
+                nao2,
+            )
+
+    if vhfopt.uniq_l_ctr[:, 0].max() > gpu_ccsd_incore.int4c2e.LMAX_ON_GPU:
+        raise RuntimeError("lambda-only gpu direct vvvv does not support host integral fallback")
+
+    idx, idy = cupy.tril_indices(nao)
+    l_ctr_offsets = vhfopt.l_ctr_offsets
+    for cp_ij_id, log_q_ij in enumerate(vhfopt.log_qs):
+        cpi = cp_idx[cp_ij_id]
+        cpj = cp_jdx[cp_ij_id]
+        li = vhfopt.uniq_l_ctr[cpi, 0]
+        lj = vhfopt.uniq_l_ctr[cpj, 0]
+        if li > gpu_ccsd_incore.int4c2e.LMAX_ON_GPU or lj > gpu_ccsd_incore.int4c2e.LMAX_ON_GPU:
+            continue
+        if log_q_ij.size == 0:
+            continue
+        ish0 = l_ctr_offsets[cpi]
+        jsh0 = l_ctr_offsets[cpj]
+        ish1 = l_ctr_offsets[cpi + 1]
+        jsh1 = l_ctr_offsets[cpj + 1]
+        i0, i1 = ao_loc[ish0], ao_loc[ish1]
+        j0, j1 = ao_loc[jsh0], ao_loc[jsh1]
+        eri = cupy.zeros((i1 - i0, nao, j1 - j0, nao))
+        strides = [1, (j1 - j0) * nao, (j1 - j0) * nao**2, nao]
+        gpu_ccsd_incore._fill_eri_block(eri, strides, [0, 0, i0, j0], vhfopt, cp_ij_id)
+        eri[:, idx, :, idy] = eri[:, idy, :, idx]
+        contract_vvvv_block(eri, i0, i1, j0, j1)
+
+    ht2tril = cupy.einsum("xpq,pa->xaq", ht2ao, orbv)
+    ht2tril = cupy.einsum("xaq,qb->xab", ht2tril, orbv)
+    if gpu_ccsd_incore.FREE_CUPY_CACHE:
+        cupy.get_default_memory_pool().free_all_blocks()
+    return gpu_ccsd_incore._unpack_t2_tril(ht2tril, nocc, nvir)
+
+
+def _add_vvvv_gpu(mycc, l2, eris, log, imds=None):
     """Return the lambda ``vvvv`` contraction on GPU.
 
     This reuses the GPU4PySCF direct AO ``vvvv`` path. Setting ``t1 = 0``
@@ -90,17 +278,27 @@ def _add_vvvv_gpu(mycc, l2, log):
     ``Ht2 = einsum('ijcd,acdb->ijab', l2, vvvv)`` piece required by the
     lambda equations.
     """
-    direct_vvvv = _get_gpu_direct_vvvv()
-    if direct_vvvv is False:
+    if getattr(eris, "vvvv", None) is not None:
+        try:
+            return cupy.asarray(_add_vvvv_gpu_dense_prepacked(mycc, l2, eris, imds=imds))
+        except Exception as exc:
+            log.debug1("dense-prepacked gpu vvvv failed; trying AO-direct helper: %s", exc)
+
+    if _get_gpu_direct_vvvv() is False:
         raise RuntimeError("gpu4pyscf direct vvvv helper is unavailable")
 
-    nocc, nvir = l2.shape[0], l2.shape[2]
-    zero_t1 = cupy.zeros((nocc, nvir), dtype=l2.dtype)
     try:
-        _, _, l2new, _, _ = direct_vvvv(mycc, zero_t1, l2)
+        l2new = _add_vvvv_gpu_lambda_only(mycc, l2, imds=imds)
     except Exception as exc:
-        log.debug1("gpu direct vvvv failed; falling back to CPU helper: %s", exc)
-        raise
+        log.debug1("lambda-only gpu direct vvvv failed; trying full helper: %s", exc)
+        direct_vvvv = _get_gpu_direct_vvvv()
+        nocc, nvir = l2.shape[0], l2.shape[2]
+        zero_t1 = cupy.zeros((nocc, nvir), dtype=l2.dtype)
+        try:
+            _, _, l2new, _, _ = direct_vvvv(mycc, zero_t1, l2)
+        except Exception as exc2:
+            log.debug1("gpu direct vvvv failed; falling back to CPU helper: %s", exc2)
+            raise
     return cupy.asarray(l2new)
 
 
@@ -119,6 +317,38 @@ def _make_tau_gpu(t2, t1a, t1b, fac=1.0):
     tau = cupy.einsum("ia,jb->ijab", t1a * fac, t1b)
     tau += t2
     return tau
+
+
+def _contract_m4_ovvv_blocked(l2, t1, eris_ovvv, occ_blksize):
+    """Blocked form of einsum('jidc,kc,kadb->ijab', l2, t1, eris_ovvv)."""
+    nocc = t1.shape[0]
+    m4 = cupy.zeros(
+        (l2.shape[0], l2.shape[1], eris_ovvv.shape[1], eris_ovvv.shape[3]),
+        dtype=l2.dtype,
+    )
+    for k0, k1 in lib.prange(0, nocc, occ_blksize):
+        m4 += cupy.einsum("jidc,kc,kadb->ijab", l2, t1[k0:k1], eris_ovvv[k0:k1])
+    return m4
+
+
+def _contract_m4_voov_blocked(l2, tau, eris_voov, occ_blksize):
+    """Blocked form of einsum('ijcd,klcd,aklb->ijab', l2, tau, eris_voov)."""
+    nocc = tau.shape[0]
+    m4 = cupy.zeros((l2.shape[0], l2.shape[1], eris_voov.shape[0], eris_voov.shape[3]), dtype=l2.dtype)
+    for k0, k1 in lib.prange(0, nocc, occ_blksize):
+        for l0, l1 in lib.prange(0, nocc, occ_blksize):
+            m4 += cupy.einsum(
+                "ijcd,klcd,aklb->ijab",
+                l2,
+                tau[k0:k1, l0:l1],
+                eris_voov[:, k0:k1, l0:l1],
+            )
+    return m4
+
+
+def _should_use_occ_blocking(nocc, nvir):
+    """Use occupied blocking only once the problem is large enough to justify it."""
+    return nocc >= 10 or (nocc * nvir) >= 1000
 
 
 def _prepare_virtual_block_cache(eris, nvir, blksize):
@@ -163,6 +393,8 @@ def make_intermediates_gpu(mycc, t1, t2, eris):
     imds.wVOov = cupy.zeros((nvir, nocc, nocc, nvir), dtype=t1.dtype)
     imds.wvOOv = cupy.zeros((nvir, nocc, nocc, nvir), dtype=t1.dtype)
     imds.wvvov = cupy.zeros((nvir, nvir, nocc, nvir), dtype=t1.dtype)
+    imds.oovv = _as_cupy_c_order(eris.oovv)
+    imds.ovoo = _as_cupy_c_order(eris.ovoo)
 
     w1 = fvv - cupy.einsum("ja,jb->ba", fov, t1)
     w2 = foo + cupy.einsum("ib,jb->ij", fov, t1)
@@ -181,6 +413,7 @@ def make_intermediates_gpu(mycc, t1, t2, eris):
 
     block_cache = _prepare_virtual_block_cache(eris, nvir, blksize)
     imds.block_cache = block_cache
+    imds.vvov_blocks_cpu = [entry["vvov"] for entry in block_cache]
 
     woooo = cupy.zeros((nocc, nocc, nocc, nocc), dtype=t1.dtype)
     wvooo = cupy.zeros((nvir, nocc, nocc, nocc), dtype=t1.dtype)
@@ -190,9 +423,7 @@ def make_intermediates_gpu(mycc, t1, t2, eris):
         p0 = block["p0"]
         p1 = block["p1"]
         eris_ovvv = cupy.asarray(block["ovvv"])
-        eris_vvov = _build_vvov_slice(
-            [entry["vvov"] for entry in block_cache], p0, p1, nvir, nocc, t1.dtype
-        )
+        eris_vvov = _build_vvov_slice(imds.vvov_blocks_cpu, p0, p1, nvir, nocc, t1.dtype)
 
         w1 += cupy.einsum("jcba,jc->ba", eris_ovvv, t1[:, p0:p1] * 2)
         w1[:, p0:p1] -= cupy.einsum("jabc,jc->ba", eris_ovvv, t1)
@@ -295,6 +526,7 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=F
         imds = make_intermediates_gpu(mycc, t1, t2, eris)
     time0 = logger.process_clock(), logger.perf_counter()
     log = logger.Logger(mycc.stdout, mycc.verbose)
+    wall0 = time.perf_counter()
 
     t1 = _to_gpu(t1)
     t2 = _to_gpu(t2)
@@ -315,6 +547,7 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=F
     mia1 -= reduce(cupy.dot, (t1, l1.T, t1))
     mia1 -= cupy.einsum("bd,jd->jb", mba, t1)
     mia1 -= cupy.einsum("lj,lb->jb", mij, t1)
+    t_preamble = time.perf_counter()
 
     if use_cpu_vvvv:
         l2new = cupy.asarray(
@@ -322,11 +555,12 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=F
         )
     else:
         try:
-            l2new = _add_vvvv_gpu(mycc, l2, log)
+            l2new = _add_vvvv_gpu(mycc, l2, eris, log, imds=imds)
         except Exception:
             l2new = cupy.asarray(
                 mycc._add_vvvv(None, _to_cpu(l2), eris, with_ovvv=False, t2sym="jiba")
             )
+    t_vvvv = time.perf_counter()
     l1new = cupy.einsum("ijab,jb->ia", l2new, t1) * 2
     l1new -= cupy.einsum("jiab,jb->ia", l2new, t1)
     l2new *= 0.5
@@ -346,34 +580,47 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=F
     l2new += cupy.einsum("jibc,ca->jiba", l2, w1)
     l2new -= cupy.einsum("jk,kiba->jiba", w2, l2)
 
-    eris_ovoo = _as_cupy_c_order(eris.ovoo)
+    eris_ovoo = imds.ovoo
     l1new -= cupy.einsum("iajk,kj->ia", eris_ovoo, mij1) * 2
     l1new += cupy.einsum("jaik,kj->ia", eris_ovoo, mij1)
     l2new -= cupy.einsum("jbki,ka->jiba", eris_ovoo, l1)
 
     tau = _make_tau_gpu(t2, t1, t1)
     l2_perm = l2.transpose(0, 2, 1, 3) - l2.transpose(0, 3, 1, 2) * 0.5
+    t_setup = time.perf_counter()
 
     blksize = _gpu_block_size(mycc, nocc, nvir, tensor_factor=10 * max(1, nocc))
+    use_occ_blocking = _should_use_occ_blocking(nocc, nvir)
+    occ_blksize = min(
+        nocc, _gpu_block_size(mycc, nocc, nocc, tensor_factor=6 * max(1, nvir))
+    )
     log.debug1(
-        "gpu lambda update: block size = %d, nvir = %d in %d blocks",
+        "gpu lambda update: vir block size = %d, occ block size = %d, use_occ_blocking = %s, nvir = %d in %d blocks",
         blksize,
+        occ_blksize,
+        use_occ_blocking,
         nvir,
         int((nvir + blksize - 1) // blksize),
     )
 
-    oovv_full = _as_cupy_c_order(eris.oovv)
-    l1new -= cupy.einsum("jb,jiab->ia", l1, oovv_full)
+    l1new -= cupy.einsum("jb,jiab->ia", l1, imds.oovv)
+    ovvv_m4_time = 0.0
+    voov_m4_time = 0.0
+    other_block_time = 0.0
     for block in imds.block_cache:
+        block0 = time.perf_counter()
         p0 = block["p0"]
         p1 = block["p1"]
         eris_ovvv = cupy.asarray(block["ovvv"])
         l1new[:, p0:p1] += cupy.einsum("iabc,bc->ia", eris_ovvv, mba1) * 2
         l1new -= cupy.einsum("ibca,bc->ia", eris_ovvv, mba1[p0:p1])
         l2new[:, :, p0:p1] += cupy.einsum("jbac,ic->jiba", eris_ovvv, l1)
-        # Fuse the l2-t1 contraction into the ovvv contraction to avoid
-        # materializing the full nocc^3*nvir l2t1 tensor.
-        m4 = cupy.einsum("jidc,kc,kadb->ijab", l2, t1, eris_ovvv)
+        m4_t0 = time.perf_counter()
+        if use_occ_blocking:
+            m4 = _contract_m4_ovvv_blocked(l2, t1, eris_ovvv, occ_blksize)
+        else:
+            m4 = cupy.einsum("jidc,kc,kadb->ijab", l2, t1, eris_ovvv)
+        ovvv_m4_time += time.perf_counter() - m4_t0
         l2new[:, :, p0:p1] -= m4
         l1new[:, p0:p1] -= cupy.einsum("ijab,jb->ia", m4, t1) * 2
         l1new -= cupy.einsum("ijab,ia->jb", m4, t1[:, p0:p1]) * 2
@@ -387,9 +634,12 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=F
         l2new[:, :, p0:p1] -= cupy.einsum("bjka,ik->jiba", eris_voov, mij1)
         l1new[:, p0:p1] += cupy.einsum("aijb,jb->ia", eris_voov, mia1) * 2
         l1new -= cupy.einsum("bija,jb->ia", eris_voov, mia1[:, p0:p1])
-        # Fuse the l2-tau contraction into the voov block contraction to avoid
-        # materializing the full nocc^4 l2tau tensor.
-        m4 = cupy.einsum("ijcd,klcd,aklb->ijab", l2, tau, eris_voov)
+        m4_t0 = time.perf_counter()
+        if use_occ_blocking:
+            m4 = _contract_m4_voov_blocked(l2, tau, eris_voov, occ_blksize)
+        else:
+            m4 = cupy.einsum("ijcd,klcd,aklb->ijab", l2, tau, eris_voov)
+        voov_m4_time += time.perf_counter() - m4_t0
         l2new[:, :, p0:p1] += m4 * 0.5
         l1new[:, p0:p1] += cupy.einsum("ijab,jb->ia", m4, t1) * 2
         l1new -= cupy.einsum("ijba,jb->ia", m4, t1[:, p0:p1])
@@ -406,6 +656,7 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=F
         tmp = cupy.einsum("jkca,bikc->jiba", l2, saved_wvOOv)
         l2new[:, :, p0:p1] += tmp
         l2new[:, :, p0:p1] += tmp.transpose(1, 0, 2, 3) * 0.5
+        other_block_time += time.perf_counter() - block0
 
     saved_woooo = imds.woooo
     m3 = cupy.einsum("ijkl,klab->ijab", saved_woooo, l2)
@@ -424,6 +675,18 @@ def update_lambda_gpu(mycc, t1, t2, l1, l2, eris=None, imds=None, use_cpu_vvvv=F
         l2new[i, i] = l2new[i, i] + l2new[i, i].T
         l2new[i, i] /= eia[i][:, None] + eia[i][None, :]
 
+    wall_end = time.perf_counter()
+    log.info(
+        "gpu lambda timing: preamble=%.3fs vvvv=%.3fs setup=%.3fs ovvv_m4=%.3fs voov_m4=%.3fs other_blocks=%.3fs tail=%.3fs total=%.3fs",
+        t_preamble - wall0,
+        t_vvvv - t_preamble,
+        t_setup - t_vvvv,
+        ovvv_m4_time,
+        voov_m4_time,
+        max(0.0, other_block_time - ovvv_m4_time - voov_m4_time),
+        wall_end - (t_setup + other_block_time),
+        wall_end - wall0,
+    )
     log.timer_debug1("gpu update l1 l2", *time0)
     return l1new, l2new
 

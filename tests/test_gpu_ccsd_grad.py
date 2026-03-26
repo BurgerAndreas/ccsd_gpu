@@ -12,6 +12,7 @@ import numpy as np
 from pyscf import gto, scf, cc as pyscf_cc
 from pyscf.grad import ccsd as ccsd_grad
 
+import ccsd_gpu.gpu_ccsd_grad as gpu_ccsd_grad
 from ccsd_gpu.gpu_ccsd_grad import compute_ml_ccsd_forces_gpu
 from ccsd_gpu.gpu_ccsd_lambda import solve_lambda_gpu
 
@@ -84,6 +85,35 @@ def test_lambda_matches_cpu_reference():
     assert np.max(np.abs(t2_gpu - t2_cpu)) < 1e-10
     assert np.max(np.abs(l1_gpu - l1_cpu)) < 1e-7
     assert np.max(np.abs(l2_gpu - l2_cpu)) < 1e-7
+
+
+def test_compute_ml_ccsd_forces_gpu_falls_back_to_blocked(monkeypatch):
+    mol = make_hf_molecule()
+    mf, t1, t2, l1, l2 = run_ccsd_and_lambda_cpu(mol)
+    expected = np.array(mf.nuc_grad_method().grad_nuc())
+
+    monkeypatch.setattr(
+        gpu_ccsd_grad,
+        "_should_fallback_grad_to_cpu",
+        lambda t1_: (True, "forced test fallback", {"peak_bytes": 1}),
+    )
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("GPU gradient path should not be called when fallback is forced")
+
+    monkeypatch.setattr(gpu_ccsd_grad, "grad_elec_gpu", fail_if_called)
+    calls = {"count": 0}
+
+    def fake_blocked(*args, **kwargs):
+        calls["count"] += 1
+        return np.zeros((mf.mol.natm, 3))
+
+    monkeypatch.setattr(gpu_ccsd_grad, "grad_elec_gpu_blocked", fake_blocked)
+
+    forces = compute_ml_ccsd_forces_gpu(mf, t1, t2, l1, l2)
+
+    assert calls["count"] == 1
+    assert np.allclose(forces, expected)
 
 
 def test_molecule(name, mol, atol=1e-6):
